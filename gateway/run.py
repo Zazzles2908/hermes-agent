@@ -15207,7 +15207,9 @@ class GatewayRunner:
             )
             _has_fresh_tool_tail = bool(
                 agent_history
+                and len(agent_history) >= 2
                 and agent_history[-1].get("role") == "tool"
+                and agent_history[-2].get("role") != "assistant"
                 and _interruption_is_fresh
             )
 
