@@ -987,3 +987,93 @@ not the specific names.
 
 Reviewers should reject new change-detector tests; authors should convert
 them into invariants before re-requesting review.
+
+
+---
+
+## ⚠️ FORK-SPECIFIC INSTRUCTIONS (Read Before Updating)
+
+This repository is **NOT** the vanilla NousResearch/hermes-agent. It is a fork
+(`Zazzles2908/hermes-agent`) that contains local patches and bug fixes.
+
+### Remotes
+
+```
+origin    git@github.com:Zazzles2908/hermes-agent.git   (this fork — our patches live here)
+upstream  https://github.com/NousResearch/hermes-agent.git (official — read-only)
+```
+
+### ❌ NEVER run `hermes update`
+
+The built-in `hermes update` command does `git reset --hard origin/main`.
+Because `origin` now points to **our fork**, running `hermes update` would:
+- ✅ Preserve our committed patches (they're on the fork)
+- ❌ Destroy any **uncommitted** local changes
+- ❌ **NOT** pull upstream changes from NousResearch
+
+### ✅ Correct Update Procedure
+
+Use the safe update script:
+
+```bash
+# Standard merge (recommended)
+~/.config/agents/skills/hermes-validation/safe-update.sh
+
+# Rebase for cleaner history
+~/.config/agents/skills/hermes-validation/safe-update.sh --rebase
+
+# Preview what would happen
+~/.config/agents/skills/hermes-validation/safe-update.sh --dry-run
+```
+
+What it does:
+1. Stashes uncommitted changes
+2. Creates a backup branch
+3. Fetches `upstream/main`
+4. Merges or rebases onto `upstream/main`
+5. Reinstalls with `uv pip install -e .`
+
+### Manual Update (if script unavailable)
+
+```bash
+cd ~/.hermes/hermes-agent
+git fetch upstream
+git checkout main
+
+# Option A: Merge (safer, preserves history)
+git merge upstream/main
+
+# Option B: Rebase (cleaner history, may require conflict resolution)
+git rebase upstream/main
+
+uv pip install -e .
+python3 ~/.config/agents/skills/hermes-validation/validate.py
+```
+
+### Local Patches (Committed to Fork)
+
+| Commit | Description | Files |
+|--------|-------------|-------|
+| `76cd7f290` | `_has_fresh_tool_tail` assistant-role check | `gateway/run.py` |
+| *(this session)* | Fix `_detect_api_mode_for_url` Kimi over-match | `hermes_cli/runtime_provider.py` |
+| *(this session)* | Fix `/v1` stripping for `kimi-coding` Anthropic mode | `hermes_cli/runtime_provider.py` |
+| *(this session)* | Honor `api_mode` in fallback provider entries | `gateway/run.py` |
+
+### Validation After Any Update
+
+Always run after updating:
+
+```bash
+python3 ~/.config/agents/skills/hermes-validation/validate.py
+```
+
+### Rollback
+
+If an update breaks something:
+
+```bash
+cd ~/.hermes/hermes-agent
+git branch -a | grep backup/pre-update  # find backup branch
+git reset --hard backup/pre-update-YYYYMMDD-HHMMSS
+uv pip install -e .
+```

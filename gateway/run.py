@@ -734,10 +734,14 @@ def _try_resolve_fallback_provider() -> dict | None:
                     explicit_base_url=entry.get("base_url"),
                     explicit_api_key=entry.get("api_key"),
                 )
+                # Honor per-entry api_mode override from fallback config
+                if entry.get("api_mode"):
+                    runtime["api_mode"] = entry["api_mode"]
                 logger.info(
-                    "Fallback provider resolved: %s model=%s",
+                    "Fallback provider resolved: %s model=%s api_mode=%s",
                     runtime.get("provider"),
                     entry.get("model"),
+                    runtime.get("api_mode"),
                 )
                 return {
                     "api_key": runtime.get("api_key"),
