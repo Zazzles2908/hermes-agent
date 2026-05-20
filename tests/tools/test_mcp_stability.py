@@ -320,3 +320,128 @@ class TestMCPInitialConnectionRetry:
                 await task
 
         asyncio.get_event_loop().run_until_complete(_run())
+
+
+# ---------------------------------------------------------------------------
+# Fix 5: Lock-file-based dedup / stale-process cleanup
+# ---------------------------------------------------------------------------
+
+class TestMCPLockFileDedup:
+    """Lock files track stdio PIDs; stale locks are cleaned on startup."""
+
+    def test_lock_path_is_deterministic(self):
+        from tools.mcp_tool import _mcp_lock_path
+        assert _mcp_lock_path("excel") == "/tmp/hermes-mcp-excel.lock"
+        assert _mcp_lock_path("my-server") == "/tmp/hermes-mcp-my-server.lock"
+        # Unsafe chars are sanitized
+        assert _mcp_lock_path("server/name") == "/tmp/hermes-mcp-server_name.lock"
+
+    def test_read_write_remove_lock_roundtrip(self, tmp_path):
+        from tools.mcp_tool import _read_lock_pid, _write_lock_pid, _remove_lock
+        lock = str(tmp_path / "test.lock")
+        assert _read_lock_pid(lock) is None
+        _write_lock_pid(lock, 12345)
+        assert _read_lock_pid(lock) == 12345
+        _remove_lock(lock)
+        assert _read_lock_pid(lock) is None
+
+    def test_cleanup_stale_locks_removes_dead_pids(self, tmp_path, monkeypatch):
+        from tools.mcp_tool import _cleanup_stale_mcp_locks, _MCP_LOCK_PREFIX
+        # Point lock dir at a temp location so we don't touch /tmp
+        monkeypatch.setattr(
+            "tools.mcp_tool._MCP_LOCK_DIR", str(tmp_path)
+        )
+        lock = tmp_path / f"{_MCP_LOCK_PREFIX}excel.lock"
+        lock.write_text("999999999\n")
+        _cleanup_stale_mcp_locks()
+        assert not lock.exists()
+
+    def test_cleanup_stale_locks_kills_live_mcp_process(self, tmp_path, monkeypatch):
+        from tools.mcp_tool import _cleanup_stale_mcp_locks, _MCP_LOCK_PREFIX
+        monkeypatch.setattr("tools.mcp_tool._MCP_LOCK_DIR", str(tmp_path))
+        lock = tmp_path / f"{_MCP_LOCK_PREFIX}excel.lock"
+        fake_pid = 424242
+        lock.write_text(f"{fake_pid}\n")
+
+        # PID exists and looks like an MCP process
+        with patch("tools.mcp_tool._pid_exists", return_value=True), \
+             patch("tools.mcp_tool._is_likely_mcp_process", return_value=True), \
+             patch("tools.mcp_tool._kill_pid_sync") as mock_kill:
+            _cleanup_stale_mcp_locks()
+
+        mock_kill.assert_called_once_with(fake_pid, "excel")
+        assert not lock.exists()
+
+    def test_dedup_kills_lock_file_pid(self, monkeypatch):
+        from tools.mcp_tool import _dedup_mcp_server, _mcp_lock_path
+        import asyncio
+
+        fake_pid = 424243
+        lock_path = _mcp_lock_path("test-dedup")
+        # Create a fake lock file
+        with open(lock_path, "w") as f:
+            f.write(f"{fake_pid}\n")
+
+        async def _run():
+            with patch("tools.mcp_tool._pid_exists", return_value=True), \
+                 patch("tools.mcp_tool._is_likely_mcp_process", return_value=True), \
+                 patch("tools.mcp_tool._kill_pid_async") as mock_kill:
+                await _dedup_mcp_server("test-dedup", {"command": "node", "args": ["server.js"]})
+                mock_kill.assert_called_once_with(fake_pid, "test-dedup")
+
+        try:
+            asyncio.get_event_loop().run_until_complete(_run())
+        finally:
+            import os
+            try:
+                os.unlink(lock_path)
+            except FileNotFoundError:
+                pass
+
+    def test_dedup_falls_back_to_pgrep(self, monkeypatch):
+        from tools.mcp_tool import _dedup_mcp_server
+        import asyncio
+
+        async def _run():
+            with patch("tools.mcp_tool._read_lock_pid", return_value=None), \
+                 patch("tools.mcp_tool.subprocess.run") as mock_run, \
+                 patch("tools.mcp_tool._kill_pid_async") as mock_kill:
+                # Simulate pgrep finding a match
+                mock_run.return_value.returncode = 0
+                mock_run.return_value.stdout = "55555\n"
+                await _dedup_mcp_server("playwright", {"command": "npx", "args": ["-y", "@playwright/mcp"]})
+                mock_run.assert_called_once()
+                mock_kill.assert_called_once_with(55555, "playwright")
+
+        asyncio.get_event_loop().run_until_complete(_run())
+
+    def test_is_likely_mcp_process_uses_cmdline(self):
+        from tools.mcp_tool import _is_likely_mcp_process
+        from unittest.mock import mock_open
+        with patch("builtins.open", mock_open(read_data=b"npx\x00-y\x00@mcp/server\x00")):
+            assert _is_likely_mcp_process(1234, "server") is True
+        with patch("builtins.open", mock_open(read_data=b"/usr/bin/sleep\x0060\x00")):
+            assert _is_likely_mcp_process(1234, "server") is False
+
+    def test_kill_pid_sync_terminates_then_kills(self, monkeypatch):
+        from tools.mcp_tool import _kill_pid_sync
+        fake_pid = 98765
+        monkeypatch.setattr(signal, "SIGKILL", 9, raising=False)
+        with patch("tools.mcp_tool.os.kill") as mock_kill, \
+             patch("tools.mcp_tool._pid_exists", return_value=False), \
+             patch("tools.mcp_tool.time.sleep") as mock_sleep:
+            _kill_pid_sync(fake_pid, "test-srv")
+        # SIGTERM, then after sleep the process is gone -> no SIGKILL
+        mock_kill.assert_called_once_with(fake_pid, signal.SIGTERM)
+        mock_sleep.assert_called_once_with(2)
+
+    def test_kill_pid_async_terminates_without_blocking(self):
+        from tools.mcp_tool import _kill_pid_async
+        import asyncio
+        fake_pid = 98766
+        async def _run():
+            with patch("tools.mcp_tool.os.kill") as mock_kill, \
+                 patch("tools.mcp_tool._pid_exists", side_effect=[True, True, False]):
+                await _kill_pid_async(fake_pid, "test-srv")
+            mock_kill.assert_called_once_with(fake_pid, signal.SIGTERM)
+        asyncio.get_event_loop().run_until_complete(_run())

@@ -79,6 +79,7 @@ Thread safety:
 
 import asyncio
 import concurrent.futures
+import glob
 import inspect
 import json
 import logging
@@ -86,12 +87,16 @@ import math
 import os
 import re
 import shutil
+import signal
+import subprocess
 import sys
 import threading
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
+
+from gateway.status import _pid_exists
 
 logger = logging.getLogger(__name__)
 
@@ -1305,6 +1310,10 @@ class MCPServerTask:
                     with _lock:
                         for _pid in new_pids:
                             _stdio_pids[_pid] = self.name
+                    # Write lock file so future gateway restarts can detect
+                    # and kill this process if it becomes orphaned.
+                    for _pid in new_pids:
+                        _write_lock_pid(_mcp_lock_path(self.name), _pid)
                 async with ClientSession(
                     read_stream, write_stream, **sampling_kwargs
                 ) as session:
@@ -1322,6 +1331,7 @@ class MCPServerTask:
             # teardown failed (common when the task is cancelled mid-way
             # on Linux, where setsid() children escape the parent cgroup).
             # Mark them as orphans so the next cleanup sweep can reap them.
+            _remove_lock(_mcp_lock_path(self.name))
             if new_pids:
                 with _lock:
                     for _pid in new_pids:
@@ -1700,6 +1710,8 @@ class MCPServerTask:
             _forget_mcp_tool_server(tool_name)
         self._registered_tool_names = []
         self.session = None
+        # Remove lock file so the process is no longer tracked as active.
+        _remove_lock(_mcp_lock_path(self.name))
 
 
 # ---------------------------------------------------------------------------
@@ -2122,6 +2134,178 @@ def _snapshot_child_pids() -> set:
         pass
 
     return set()
+
+
+# ---------------------------------------------------------------------------
+# Lock-file-based dedup / stale-process cleanup
+# ---------------------------------------------------------------------------
+#
+# Each stdio MCP server writes its subprocess PID to a lock file on spawn
+# and removes it on clean shutdown.  On gateway start we scan all lock
+# files and kill any processes that survived a previous gateway run (orphans).
+# Before spawning a new server we also check its lock file and kill any
+# existing instance so duplicates are impossible.
+
+_MCP_LOCK_DIR = "/tmp"
+_MCP_LOCK_PREFIX = "hermes-mcp-"
+
+
+def _mcp_lock_path(server_name: str) -> str:
+    """Return the filesystem path for a server's lock file."""
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", server_name)
+    return os.path.join(_MCP_LOCK_DIR, f"{_MCP_LOCK_PREFIX}{safe_name}.lock")
+
+
+def _read_lock_pid(lock_path: str) -> Optional[int]:
+    """Read the PID stored in a lock file, or None if missing/invalid."""
+    try:
+        with open(lock_path, "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+
+
+def _write_lock_pid(lock_path: str, pid: int) -> None:
+    """Atomically write PID to a lock file."""
+    try:
+        tmp_path = lock_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(f"{pid}\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, lock_path)
+    except OSError as exc:
+        logger.debug("Failed to write MCP lock file %s: %s", lock_path, exc)
+
+
+def _remove_lock(lock_path: str) -> None:
+    """Best-effort removal of a lock file."""
+    try:
+        os.unlink(lock_path)
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def _is_likely_mcp_process(pid: int, server_name: str) -> bool:
+    """Heuristic: does ``pid`` look like an MCP server subprocess?"""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = (
+                f.read().replace(b"\x00", b" ").decode("utf-8", errors="replace").lower()
+            )
+    except (FileNotFoundError, OSError):
+        return False
+    # Broad but conservative heuristic — matches node-based, python-based,
+    # and generic MCP servers without being so narrow we miss variants.
+    indicators = ("mcp", "npx", "node", "python", "uvx", server_name.lower())
+    return any(ind in cmdline for ind in indicators)
+
+
+def _kill_pid_sync(pid: int, server_name: str) -> None:
+    """Send SIGTERM, wait 2 s, then SIGKILL if the process is still alive.
+
+    Synchronous — safe to call from the main thread during startup/shutdown.
+    """
+    try:
+        os.kill(pid, signal.SIGTERM)
+        logger.info("Sent SIGTERM to stale MCP process %d (%s)", pid, server_name)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+    time.sleep(2)
+    if not _pid_exists(pid):
+        return
+    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+    try:
+        os.kill(pid, _sigkill)
+        logger.warning("Force-killed stale MCP process %d (%s)", pid, server_name)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+async def _kill_pid_async(pid: int, server_name: str) -> None:
+    """Async version of _kill_pid_sync for use on the MCP event loop."""
+    try:
+        os.kill(pid, signal.SIGTERM)
+        logger.info("Sent SIGTERM to stale MCP process %d (%s)", pid, server_name)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+    # Poll for 2 s without blocking the event loop
+    for _ in range(20):
+        await asyncio.sleep(0.1)
+        if not _pid_exists(pid):
+            return
+    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+    try:
+        os.kill(pid, _sigkill)
+        logger.warning("Force-killed stale MCP process %d (%s)", pid, server_name)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _cleanup_stale_mcp_locks() -> None:
+    """Scan lock files and reap orphaned MCP processes from previous gateway runs.
+
+    Called once from ``register_mcp_servers`` before any new servers are spawned.
+    """
+    pattern = os.path.join(_MCP_LOCK_DIR, f"{_MCP_LOCK_PREFIX}*.lock")
+    for lock_path in glob.glob(pattern):
+        pid = _read_lock_pid(lock_path)
+        if pid is None:
+            _remove_lock(lock_path)
+            continue
+        if not _pid_exists(pid):
+            _remove_lock(lock_path)
+            continue
+        server_name = os.path.basename(lock_path)[len(_MCP_LOCK_PREFIX) : -len(".lock")]
+        if _is_likely_mcp_process(pid, server_name):
+            _kill_pid_sync(pid, server_name)
+        _remove_lock(lock_path)
+
+
+async def _dedup_mcp_server(name: str, config: dict) -> None:
+    """Before spawning an MCP server, kill any existing instance.
+
+    Uses the lock file as the primary source of truth, with a pgrep fallback
+    for cases where the lock file was lost but the process is still running.
+    """
+    lock_path = _mcp_lock_path(name)
+    pid = _read_lock_pid(lock_path)
+    if pid is not None and _pid_exists(pid) and _is_likely_mcp_process(pid, name):
+        await _kill_pid_async(pid, name)
+        _remove_lock(lock_path)
+        return
+
+    _remove_lock(lock_path)
+
+    # Fallback: pgrep for command-line pattern (stdio servers only)
+    command = config.get("command")
+    args = config.get("args", [])
+    if not command:
+        return
+    try:
+        # Build a regex that matches the command and its args.
+        # pgrep -f matches the full command line.
+        pattern = re.escape(command)
+        if args:
+            pattern += r".*" + r".*".join(re.escape(str(a)) for a in args)
+        result = subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return
+        for line in result.stdout.strip().splitlines():
+            try:
+                matched_pid = int(line.strip())
+            except ValueError:
+                continue
+            if matched_pid == os.getpid():
+                continue
+            await _kill_pid_async(matched_pid, name)
+    except Exception as exc:
+        logger.debug("pgrep dedup fallback failed for '%s': %s", name, exc)
 
 
 def _mcp_loop_exception_handler(loop, context):
@@ -3162,6 +3346,10 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 
     Returns list of registered tool names.
     """
+    # Kill any stale instance before spawning (prevents duplicates after
+    # gateway restart — the in-memory _servers dict is per-process only).
+    await _dedup_mcp_server(name, config)
+
     connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
     server = await asyncio.wait_for(
         _connect_server(name, config),
@@ -3223,6 +3411,9 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
 
     if not new_servers:
         return _existing_tool_names()
+
+    # On gateway start, reap orphaned MCP processes from previous runs.
+    _cleanup_stale_mcp_locks()
 
     # Start the background event loop for MCP connections
     _ensure_mcp_loop()
